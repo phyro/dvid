@@ -1,0 +1,28 @@
+module {input: "each", defaults: {tests: "[]"}};
+# cam: every test's answer for each record, as it comes
+#
+#   frames | deem run -I -r programs/cam.deem --arg tests '[
+#     {"kind": "moment", "label": "thumbs up",
+#      "q": "Looking at `now` only, is this true: a person shows a thumbs up?"},
+#     {"kind": "labels", "labels": ["at the desk", "away"],
+#      "q": "Looking at `now` only, which of these fits it best?"}]'
+#
+# Each record is asked every test's question `q`, as `now` (or, with
+# "bare": true, as itself, for a question about "this frame"), and prints a
+# line, record<TAB>name<TAB>answer<TAB>name<TAB>answer..., a pair for each
+# test, in order: for a moment test its label and how sure the model is
+# that it is true; for a labels test the label it chooses and "-". The
+# records may be a live stream, frames of a webcam: each runs on its own
+# and prints as soon as it, and every record before it, is answered.
+# `dvid` runs it on every video, a file or live.
+#
+# Requests. A record's questions are about the same `now`, so they go in
+# one request, and a picture is shown once for all of them.
+
+def main:
+  . as $r
+  | [$r] + [$tests | fromjson | .[]
+            | (if .bare then $r else {now: $r} end) as $c
+            | if .kind == "labels" then choose(.q; .labels; $c), "-"
+              else .label, ask(.q; $c) end]
+  | @tsv;

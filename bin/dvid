@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# dvid (WHAT | --labels A,B,C) [FLAG...] VIDEO: when WHAT is true in VIDEO,
+# or VIDEO in sections, each labelled
+#
+#   dvid "a slide is shown full-screen" talk.mp4
+#   dvid --labels "intro,slides,live demo,questions" talk.mp4
+#   dvid --all --every 10s "flames or smoke are visible" fire.mp4
+#   dvid --starts --every 5s "nobody is at the desk" /dev/video0 | head -1
+#   dvid --from 5:00 --to 6:00 "a rabbit is visible" https://host/film.mp4
+#   dvid --every 2s --frames 4 "someone waves at the camera" desk.mp4
+#
+# Asks deem about one frame every --every (default 30s): whether WHAT is
+# true in it, or with --labels which label fits it best. With --frames 4,
+# about the whole --every instead: 4 frames across it, --every/3 apart,
+# from its start to its end (the next one's start), in one picture, a 2x2
+# grid; whether WHAT happens in them, so WHAT can be
+# something that takes time (a wave, a light switching on). Each frame is
+# a quarter of the picture, so small things are harder to see; and the
+# order is weak (someone leaving can pass for someone arriving).
+#
+# With WHAT, prints start<TAB>end<TAB>score for each run of frames above
+# -t (0.5), with the run's best score; with --labels, start<TAB>end<TAB>label for each run of
+# one label, where a section shorter than two frames joins the one before.
+# Nothing found is exit 1, as with grep. --all prints every frame instead,
+# time<TAB>score or time<TAB>label; --starts prints start<TAB>score or
+# start<TAB>label as soon as a run starts: live, an alarm, with | head -1.
+#
+# VIDEO is a file, a webcam (/dev/video0), a pipe (<(ffmpeg ... -f mpegts
+# -)) or a URL ffmpeg reads (https://, rtsp://; for a page on YouTube or
+# Twitch, "$(yt-dlp -g URL)"). A webcam, a pipe or a URL with no length
+# (a stream) is live: a time is the clock's, each line prints once it is
+# known, and it runs until VIDEO ends or it is stopped; a URL with one is
+# read as a file.
+# --from and --to (files only) are seconds or [HH:]MM:SS; --every is a
+# number with ms, s, m or h; a time is where its frame, or with --frames 4
+# its 4 frames, start. -q QUESTION asks your own (with --frames 4, about
+# the grid, read left to right, top to bottom); --show prints the
+# pipeline instead of running it; any other flag goes to deem.
+#
+# The stages: ffmpeg cuts frames named by their time in ms, deem answers
+# each with programs/cam.deem, and programs/runs.awk turns the answers
+# into lines.
+set -euo pipefail
+# For --show: quote a word as a person would, and only when it needs it.
+sq() {
+  case $1 in
+    "" | *[!A-Za-z0-9_./,:=+-]*)
+      if [[ $1 == *"'"* ]]; then printf %q "$1"; else printf "'%s'" "$1"; fi ;;
+    *) printf %s "$1" ;;
+  esac
+}
+args() { local a; for a; do printf " "; sq "$a"; done; }
+usage() { echo 'usage: dvid [--show] [--all | --starts] [--every N[ms|s|m|h]] [--frames 1|4] [--from T] [--to T] [-t N] [-q QUESTION] (WHAT | --labels A,B,C) [FLAG...] VIDEO' >&2; exit 2; }
+json() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "${s//$'\t'/\\t}"; }
+calc() { awk "BEGIN { printf \"%.10g\\n\", ($1) }"; }
+seconds() {
+  [[ $1 =~ ^([0-9]+:){0,2}[0-9]+$ ]] || { echo "dvid: not a time: $1" >&2; exit 2; }
+  local s=0 x p; IFS=: read -ra p <<< "$1"
+  for x in "${p[@]}"; do s=$((s * 60 + 10#$x)); done
+  echo "$s"
+}
+
+case ${1:-} in
+  grep | series | split)
+    echo "dvid: there are no verbs: dvid WHAT VIDEO for runs, --labels for sections, --all for every frame" >&2; exit 2 ;;
+esac
+show= starts=0 all=0 q= labels= every=30s frames=1 from= to= t=0.5 tset= rest=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    --show) show=1; shift ;;
+    --starts) starts=1; shift ;;
+    --all) all=1; shift ;;
+    -t | -q | --labels | --every | --frames | --from | --to)
+      [ $# -ge 2 ] || usage
+      case $1 in -q) q=$2 ;; --labels) labels=$2 ;; --every) every=$2 ;; --frames) frames=$2 ;; -t) t=$2 tset=1 ;;
+        --from) from=$(seconds "$2") ;; --to) to=$(seconds "$2") ;; esac
+      shift 2 ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+[ "$all$starts" != 11 ] || { echo "dvid: --all prints every frame; --starts, only where a run starts: one or the other" >&2; exit 2; }
+# -t is where a run of WHAT starts and ends: --labels and --all have none
+[ -z "$tset" ] || [ -z "$labels" ] || { echo "dvid: -t is for WHAT; --labels picks the label that fits best" >&2; exit 2; }
+[ -z "$tset" ] || [ "$all" = 0 ] || { echo "dvid: -t marks out runs; --all prints every score" >&2; exit 2; }
+if [ "$all" = 1 ]; then sub=series; elif [ -n "$labels" ]; then sub=split; else sub=grep; fi
+[[ $every =~ ^([0-9]+(\.[0-9]+)?)(ms|s|m|h)?$ ]] || { echo "dvid: not a length: $every" >&2; exit 2; }
+every=$(awk -v n="${BASH_REMATCH[1]}" -v u="${BASH_REMATCH[3]}" \
+  'BEGIN { printf "%.10g\n", n * (u == "ms" ? 0.001 : u == "m" ? 60 : u == "h" ? 3600 : 1) }')
+[ "$(calc "$every >= 0.001")" = 1 ] || { echo "dvid: --every must be 1ms or more" >&2; exit 2; }
+[[ $t =~ ^(0|1|0?\.[0-9]+)$ ]] || { echo "dvid: -t must be a number from 0 to 1" >&2; exit 2; }
+# 4 is a 2x2 grid, the only count measured (a 3x3 one did worse)
+[[ $frames =~ ^[14]$ ]] || { echo "dvid: --frames is 1 or 4: a frame, or 4 frames across each --every" >&2; exit 2; }
+if [ "$frames" = 1 ]; then seen='This is a frame from a video.' them=it is='Is this true in it'
+else
+  seen="These are 4 frames from a video, $(awk "BEGIN { printf \"%.2g\", $every / 3 }") s apart, in reading order: left to right, top to bottom."
+  them=them is='Does this happen in them'
+fi
+if [ -z "$q$labels" ]; then
+  # WHAT is the first word; one of deem's flags there would be the question
+  [ ${#rest[@]} -ge 2 ] || usage
+  [[ ${rest[0]} != -* ]] || { echo "dvid: deem's flags go after WHAT; '${rest[0]}' is not one of dvid's" >&2; exit 2; }
+  q="$seen $is: ${rest[0]}?"
+  rest=("${rest[@]:1}")
+elif [ ${#rest[@]} -ge 2 ] && [[ ${rest[0]} != -* ]]; then
+  # No WHAT: a first word that isn't a flag, before the video, is a mistake.
+  if [ -n "$q" ]; then echo "dvid: -q is the question; '${rest[0]}' is not a flag or the video" >&2
+  else echo "dvid: --labels takes no WHAT; to ask your own question: -q '${rest[0]}'" >&2; fi
+  exit 2
+fi
+[ -n "$q" ] || q="$seen Which of these fits $them best?"
+[ ${#rest[@]} -ge 1 ] || usage
+video=${rest[-1]}; unset 'rest[-1]'
+if [ -n "$labels" ]; then
+  IFS=, read -ra ls <<< "$labels"; l=
+  for x in "${ls[@]}"; do l+=", $(json "$x")"; done
+  tests="[{\"kind\": \"labels\", \"bare\": true, \"labels\": [${l#, }], \"q\": $(json "$q")}]"
+else tests="[{\"kind\": \"moment\", \"bare\": true, \"label\": \"\", \"q\": $(json "$q")}]"; fi
+
+root=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+run="deem run -I -r --arg tests $(sq "$tests") $(sq "$root/programs/cam.deem")$(args "${rest[@]}")"
+reduce="awk -F '\\t' -v mode=$sub -v every=$every -v t=$t -v min=$(calc "2 * $every") -v starts=$starts"
+# fps keeps the last frame of each tick; round=up makes that the one at
+# the tick's time, not half a tick later. A frame fits in 640 by 640,
+# padded to the API's least, 280 a side. A frame's name is its time in ms.
+# Its sides are even: pad rounds a 4:2:0 frame's down to even, and fails
+# if that is less than the frame's. With --frames 4, 4 frames of 320 by
+# 320 at most make one, 4 px apart: its last frame is the next one's
+# first, so no moment falls between two. tile names one by its first new
+# frame, a third of --every late but for the first, which has no frame of
+# the one before.
+if [ "$frames" = 1 ]; then grid="fps=1/$every:round=up,scale=640:640"
+else grid="fps=3/$every:round=up,scale=320:320"; fi
+grid+=":force_original_aspect_ratio=decrease:force_divisible_by=2"
+[ "$frames" = 1 ] || grid+=",tile=2x2:padding=4:overlap=1,setpts=PTS-gt(N\\,0)*$every/3/TB"
+vf="$grid,pad=w=max(iw\\,280):h=max(ih\\,280):x=(ow-iw)/2:y=(oh-ih)/2"
+named="-vsync passthrough -enc_time_base 1:1000 -frame_pts 1"
+
+# Each frame goes to deem as ffmpeg writes it, renamed to base, in ms, plus
+# its time. A file's base is 0, so a time is the frame's place in it.
+# A URL is live if ffprobe finds it has no length; it asks now, so
+# --show prints the branch it found.
+live=
+if [ -c "$video" ] || [ -p "$video" ]; then live=1
+elif [[ $video =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]]; then
+  len=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$video") ||
+    { echo "dvid: can't read the video '$video'" >&2; exit 2; }
+  [[ $len =~ ^[0-9] ]] || live=1
+elif [ -z "$show" ] && [ ! -e "$video" ]; then
+  echo "dvid: no video '$video' (the last word is the video)" >&2; exit 2
+fi
+if [ -n "$live" ]; then
+  [ -z "$from$to" ] || { echo "dvid: a live video has no --from or --to; to stop after a while: timeout 10m dvid ..." >&2; exit 2; }
+  # Live, ffmpeg stamps each frame with the clock as it reads it, less the
+  # second dvid started, base (a frame's name holds 31 bits), before fps:
+  # after it a tick is --every, the second a fraction of one, and setpts,
+  # which truncates, could give the first two frames one time.
+  start='base=$(date +%s)'
+  in="-use_wallclock_as_timestamps 1 -copyts"
+  [ ! -c "$video" ] || in+=" -f v4l2"
+  in+=" -i $(sq "$video")"
+  pre='setpts=PTS-$base/TB,' post=,settb=1/1000
+  reduce+=" -v live=1"
+else
+  # The last run ends with the video, or at --to if that's sooner.
+  end="ffprobe -v error -show_entries format=duration -of csv=p=0 $(sq "$video")" end_raw=$end
+  [ -z "$to" ] || end="{ echo $to; $end; } | sort -n | head -1"
+  start="base=0; end=\$($end) && [ -n \"\$end\" ] || exit 2"
+  in="-skip_frame noref"
+  pre= post=,settb=1/1000
+  [ -z "$from" ] || { in+=" -ss $from"; post+=",setpts=PTS+$from/TB"; }
+  if [ "$frames" = 1 ]; then [ -z "$to" ] || in+=" -to $to"
+  else
+    # only whole grids: the last ends with a frame at the end, or at --to,
+    # read just past it (its next would be a third of --every on)
+    start+="; stop=\$($end_raw | awk -v e=\"\$end\" '{ d = \$1 - $every / 12; if (e + 0 < d) d = e
+  n = int((d - ${from:-0}) / $every + 1e-9); if (n > 0) printf \"%.3f\\n\", ${from:-0} + (n + 1 / 6) * $every }')
+[ -n \"\$stop\" ] || { echo 'dvid: the video is shorter than --every, the time 4 frames cover: lower --every' >&2; exit 2; }"
+    in+=' -to $stop'
+  fi
+  in+=" -i $(sq "$video")"
+  reduce+=' -v end="$end"'
+fi
+cmd="(set -euo pipefail; dir=\$(mktemp -d); $start
+trap 'kill \$(cat \"\$dir/pid\" 2> /dev/null) 2> /dev/null || :; rm -rf \"\$dir\"' EXIT; trap 'exit 130' INT; trap 'exit 143' TERM
+mkdir \"\$dir/in\"
+{ ffmpeg -nostdin -loglevel error $in -vf $pre$(sq "$vf")$post $named -atomic_writing 1 \"\$dir/in/%013d.jpg\" & echo \$! > \"\$dir/pid\"
+  while :; do
+    alive=1; kill -0 \$(cat \"\$dir/pid\") 2> /dev/null || alive=
+    got=
+    for f in \"\$dir\"/in/*.jpg; do
+      [ -e \"\$f\" ] || break
+      p=\${f##*/}; g=\$(printf '%s/%013d.jpg' \"\$dir\" \$((base * 1000 + 10#\${p%.jpg})))
+      mv \"\$f\" \"\$g\"; echo \"\$g\"; got=1
+    done
+    if [ -n \"\$got\" ]; then continue; elif [ -n \"\$alive\" ]; then sleep 0.1
+    else wait \$(cat \"\$dir/pid\") || exit 2; break; fi
+  done; } |
+$run |
+$reduce -f $(sq "$root/programs/runs.awk") ||
+  { s=(\"\${PIPESTATUS[@]}\"); exit \$(( s[0] == 2 ? 2 : s[1] ? s[1] : s[2] )); })"
+if [ -n "$show" ]; then echo "$cmd"; exit; fi
+eval "$cmd"
